@@ -1,0 +1,1046 @@
+DP-Attack-Story.ps1
+===============================================================================================================================================
+<#
+.SYNOPSIS
+    Pulls DefensePro attack details through Vision/CyberController and optionally via SFTP
+    from DPs (using built-in sftp.exe), then generates a report. Excludes email.
+
+.DESCRIPTION
+    Connects to Vision/CC API (placeholder functions) for attack data.
+    Optionally connects directly to DefensePro devices using the Windows built-in
+    `sftp.exe` client (requires OpenSSH Client feature) to download BDOS logs.
+    SSH Key authentication is strongly recommended for SFTP.
+    Processes data (placeholders) and generates an HTML report.
+    Supports interactive, argument-based, cached, and offline modes.
+
+.PARAMETER Environment
+    Optional: Specify an environment name used for output naming. Defaults to 'Default'.
+# ... (Keep other parameters like Offline, UseCached, Vision*, Time*, DefenseProList, PolicyList) ...
+
+.PARAMETER DefenseProUsername
+    Optional: Username for SFTP connection to DefensePro devices, overrides config default.
+
+.PARAMETER DefenseProPassword
+    Optional: Password for SFTP connection. **NOTE:** Built-in `sftp.exe` in batch mode usually
+    does NOT support non-interactive password authentication. Use SSH Keys (-DefenseProKeyPath)
+    for automation. Providing a password might lead to hangs or failures.
+
+.PARAMETER DefenseProKeyPath
+    Optional: Path to the private SSH key file for SFTP authentication to DefensePro devices.
+    Overrides the DefaultKeyPath in config.psd1. Highly recommended for automation.
+
+.EXAMPLE
+    # Run using cached credentials, last 3 hours, specific DPs/Policies, attempt SFTP with default key
+    .\DP-Attack-Story.ps1 -UseCached -Hours 3 -DefenseProList "DP1,DP2" -PolicyList "PolicyA","PolicyB"
+
+.EXAMPLE
+    # Run using cached credentials, specific DP, attempt SFTP with specific key
+    .\DP-Attack-Story.ps1 -UseCached -Hours 1 -DefenseProList "DP1-HQ" -PolicyList "" -DefenseProKeyPath "C:\Keys\dp_prod_key.pem"
+
+.NOTES
+    Author: Based on original Python script. PowerShell adaptation by AI.
+    Requires: PowerShell 5.1+, Windows OpenSSH Client (`sftp.exe` in PATH).
+    SFTP requires configuration (config.psd1 or parameters) and network access to DPs.
+    **SSH Key authentication is strongly recommended for reliable SFTP automation.**
+    Log parsing logic within Parse-AttackData is a placeholder and needs implementation.
+    SMTP functionality for email reporting is EXCLUDED.
+#>
+[CmdletBinding(DefaultParameterSetName = 'Interactive', PositionalBinding = $false)]
+param(
+    [Parameter(ParameterSetName = 'ExplicitArgs')]
+    [Parameter(ParameterSetName = 'CachedArgs')]
+    [Parameter(ParameterSetName = 'OfflineArgs')]
+    [Parameter(ParameterSetName = 'Interactive')]
+    [string]$Environment = 'Default',
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'OfflineArgs')]
+    [switch]$Offline,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'CachedArgs')]
+    [switch]$UseCached,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'ExplicitArgs')]
+    [string]$VisionIP,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'ExplicitArgs')]
+    [string]$VisionUsername,
+
+    [Parameter(ParameterSetName = 'ExplicitArgs')]
+    [System.Security.SecureString]$VisionPassword,
+
+    [Parameter(ParameterSetName = 'ExplicitArgs')]
+    [System.Security.SecureString]$VisionRootPassword,
+
+    # --- Time Range Parameters ---
+    [Parameter(ParameterSetName = 'ExplicitArgs')]
+    [Parameter(ParameterSetName = 'CachedArgs')]
+    [Parameter(ParameterSetName = 'Interactive')]
+    [ValidateRange(1, 8760)]
+    [int]$Hours,
+
+    [Parameter(ParameterSetName = 'ExplicitArgs')]
+    [Parameter(ParameterSetName = 'CachedArgs')]
+    [Parameter(ParameterSetName = 'Interactive')]
+    [ValidateCount(2, 2)]
+    [string[]]$DateRange,
+
+    [Parameter(ParameterSetName = 'ExplicitArgs')]
+    [Parameter(ParameterSetName = 'CachedArgs')]
+    [Parameter(ParameterSetName = 'Interactive')]
+    [ValidateCount(2, 2)]
+    [long[]]$EpochRange,
+
+    [Parameter(ParameterSetName = 'ExplicitArgs')]
+    [Parameter(ParameterSetName = 'CachedArgs')]
+    [Parameter(ParameterSetName = 'Interactive')]
+    [switch]$PreviousTimeRange,
+
+    # --- DP and Policy Selection ---
+    [Parameter(ParameterSetName = 'ExplicitArgs')]
+    [Parameter(ParameterSetName = 'CachedArgs')]
+    [Parameter(ParameterSetName = 'Interactive')]
+    [AllowEmptyString()]
+    [string]$DefenseProList,
+
+    [Parameter(ParameterSetName = 'ExplicitArgs')]
+    [Parameter(ParameterSetName = 'CachedArgs')]
+    [Parameter(ParameterSetName = 'Interactive')]
+    [AllowEmptyCollection()]
+    [string[]]$PolicyList,
+
+    # --- NEW: DefensePro SFTP Parameters ---
+    [Parameter(ParameterSetName = 'ExplicitArgs')]
+    [Parameter(ParameterSetName = 'CachedArgs')]
+    [Parameter(ParameterSetName = 'Interactive')]
+    [string]$DefenseProUsername, # Optional override for DP username
+
+    [Parameter(ParameterSetName = 'ExplicitArgs')]
+    [Parameter(ParameterSetName = 'CachedArgs')]
+    [Parameter(ParameterSetName = 'Interactive')]
+    [System.Security.SecureString]$DefenseProPassword, # Optional override for DP password (Use with caution for sftp.exe)
+
+    [Parameter(ParameterSetName = 'ExplicitArgs')]
+    [Parameter(ParameterSetName = 'CachedArgs')]
+    [Parameter(ParameterSetName = 'Interactive')]
+    [ValidateScript({ Test-Path $_ -PathType Leaf })]
+    [string]$DefenseProKeyPath # Optional override for DP SSH key path
+)
+
+# --- Script Setup ---
+$scriptStartTimestamp = Get-Date
+$PSScriptRoot = Split-Path -Parent -Path $MyInvocation.MyCommand.Definition
+$ConfigPath = Join-Path -Path $PSScriptRoot -ChildPath "config.psd1"
+$TempFolder = Join-Path -Path $PSScriptRoot -ChildPath "Temp"
+$OutputFolder = Join-Path -Path $PSScriptRoot -ChildPath "Output"
+$ReportsFolder = Join-Path -Path $PSScriptRoot -ChildPath "Reports"
+$LogFile = Join-Path -Path $OutputFolder -ChildPath "DP-Attack-Story_Run_$(Get-Date -Format 'yyyyMMdd_HHmmss').log" # Unique log per run
+$Global:SftpClientAvailable = $false # Track if sftp.exe is found
+
+# --- Global Variables & Configuration Loading ---
+$Global:ScriptConfig = @{}
+$Global:VisionSession = $null
+$Global:UnavailableDevices = [System.Collections.Generic.List[string]]::new()
+$Global:SelectedTimeRange = $null
+$Global:SelectedDPs = @()
+$Global:SelectedPolicies = @{}
+
+# --- Helper Functions ---
+function Load-Configuration {
+    param([string]$Path)
+    if (Test-Path -Path $Path -PathType Leaf) {
+        try {
+            $Global:ScriptConfig = Import-PowerShellDataFile -Path $Path
+            Write-Log "Configuration loaded from '$Path'"
+        } catch {
+            Write-Log "FATAL: Failed to load configuration from '$Path'. Error: $($_.Exception.Message)" -LogError -IsFatal
+        }
+    } else {
+        Write-Log "WARNING: Configuration file '$Path' not found. Using minimal defaults." -LogWarning
+        $Global:ScriptConfig = @{
+            General = @{ Top_N = 10; Compress_Output = $true; AttackWaveMinutes = 5; ExcludeFilters = ""}
+            Vision = @{}
+            DefensePro = @{} # Ensure keys exist
+        }
+    }
+}
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+        [switch]$LogWarning,
+        [switch]$LogError,
+        [switch]$IsFatal
+    )
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logLevel = "INFO"
+    if ($LogWarning) { $logLevel = "WARN" }
+    if ($LogError) { $logLevel = "ERROR" }
+    if ($IsFatal) { $logLevel = "FATAL" }
+    $logEntry = "$timestamp [$logLevel] - $Message"
+    if ($LogError -or $IsFatal) { Write-Error $logEntry -ErrorAction Continue }
+    elseif ($LogWarning) { Write-Warning $logEntry }
+    else { Write-Host $logEntry }
+    try {
+        $logDir = Split-Path -Path $LogFile -Parent
+        if (-not (Test-Path -Path $logDir)) { New-Item -Path $logDir -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null }
+        Add-Content -Path $LogFile -Value $logEntry -ErrorAction Stop
+    } catch { Write-Error "Failed to write to log file '$LogFile'. Error: $($_.Exception.Message)" -ErrorAction Continue }
+    if ($IsFatal) { Write-Host "Exiting script due to fatal error."; Exit 1 }
+}
+
+function ConvertTo-PlainText {
+    param([System.Security.SecureString]$SecureString)
+    if ($null -eq $SecureString) { return $null }
+    $ptr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
+    try { return [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
+    finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+}
+
+# --- NEW: Function to Check for sftp.exe ---
+function Check-SftpClient {
+    if ($Global:SftpClientAvailable) { return $true }
+    Write-Log "Checking for built-in OpenSSH SFTP client (sftp.exe)..."
+    try {
+        $sftpPath = Get-Command sftp.exe -ErrorAction Stop
+        Write-Log "Found sftp.exe at: $($sftpPath.Source)"
+        $Global:SftpClientAvailable = $true
+        return $true
+    } catch {
+        Write-Log "FATAL: sftp.exe not found in PATH. Ensure the Windows OpenSSH Client feature is installed and configured." -LogError
+        Write-Log "SFTP log retrieval will be skipped." -LogError
+        return $false
+    }
+}
+
+# --- Placeholder Functions for Vision API (Keep as before) ---
+function Connect-VisionAPI { param([string]$IP, [string]$Username, [System.Security.SecureString]$Password) # Placeholder
+    Write-Log "Attempting to connect to Vision API at $IP (Placeholder Function)"
+    if (-not $IP -or -not $Username -or $Password -eq $null -or $Password.Length -eq 0) { Write-Log "Error: Missing Vision connection details." -LogError; return $false }
+    $Global:VisionSession = @{ Token = "dummy-token-$(Get-Random)"; IP = $IP }
+    Write-Log "Successfully simulated connection to Vision API (Placeholder)"
+    return $true
+}
+function Get-ManagedDefenseProsFromVision { # Placeholder
+    Write-Log "Fetching managed DefensePro list from Vision (Placeholder Function)"
+    if (-not $Global:VisionSession) { Write-Log "Cannot get DPs: Not connected to Vision API." -LogError; return @() }
+    return @( @{ Name = 'DP1-HQ'; IPAddress = '192.168.1.20'; Status = 'Active'; Version = '8.40' }, @{ Name = 'DP2-DR'; IPAddress = '10.10.10.5'; Status = 'Active'; Version = '8.41' }, @{ Name = 'DP3-OLD'; IPAddress = '172.16.0.100'; Status = 'Failed'; Version = '8.30' }, @{ Name = 'DP4-LAB'; IPAddress = '192.168.99.99'; Status = 'Active'; Version = '8.42'} )
+}
+function Get-DefenseProPoliciesFromVision { param([string]$DeviceIdentifier) # Placeholder
+    Write-Log "Fetching policies for DP '$DeviceIdentifier' from Vision (Placeholder Function)"
+    if (-not $Global:VisionSession) { Write-Log "Cannot get Policies: Not connected to Vision API." -LogError; return @() }
+    if ($DeviceIdentifier -match "192\.168\.1\.20|DP1-HQ") { return @("DP1_BdosProfile", "DP1_SynFloodProtection", "DP1_WebSecurity") }
+    elseif ($DeviceIdentifier -match "10\.10\.10\.5|DP2-DR") { return @("DP2_BdosProfile", "DP2_NetworkFlood", "DP2_SpecialPolicy") }
+    elseif ($DeviceIdentifier -match "192\.168\.99\.99|DP4-LAB") { return @("LAB_Default", "LAB_Testing") }
+    else { return @("DefaultPolicy", "AnotherPolicy") }
+}
+function Get-AttackDataFromVision { param([datetime]$StartTimeUTC, [datetime]$EndTimeUTC, [array]$TargetDPIdentifiers, [hashtable]$TargetPoliciesByDP) # Placeholder (Keep offline/online logic as before)
+    Write-Log "Fetching attack data from Vision API (Placeholder Function)"
+    $startTimeISO = $StartTimeUTC.ToString("o"); $endTimeISO = $EndTimeUTC.ToString("o")
+    # ... (Rest of placeholder logic including offline caching/loading) ...
+    if ($Offline) { # Load from cache
+        $cachedDataFile = Join-Path -Path $TempFolder -ChildPath "vision_attack_data.json"
+        if (Test-Path $cachedDataFile) {
+            # ... (Load JSON) ...
+             try {
+                $jsonData = Get-Content $cachedDataFile -Raw | ConvertFrom-Json -ErrorAction Stop
+                $objectData = $jsonData | ForEach-Object {
+                    $obj = $_
+                    try {
+                        $obj.StartTime = [datetime]::Parse($obj.StartTime, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+                        $obj.EndTime = [datetime]::Parse($obj.EndTime, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+                    } catch { Write-Log "Warning: Could not parse datetime strings for AttackID $($obj.AttackID). Error: $($_.Exception.Message)" -LogWarning }
+                    $obj
+                }
+                Write-Log "Successfully loaded and parsed cached data."
+                return $objectData
+             } catch { Write-Log "Error reading/parsing cached file '$cachedDataFile': $($_.Exception.Message)" -LogError; return @() }
+        } else { Write-Log "Error: Offline mode, cached data file not found: '$cachedDataFile'" -LogError; return @() }
+    } else { # Simulate online fetch and cache
+        if (-not $Global:VisionSession) { Write-Log "Cannot get Attack Data: Not connected to Vision API." -LogError; return @() }
+        Write-Log "Simulating Vision API call..."
+        $simulatedData = @( @{ AttackID = 1001; DP = '192.168.1.20'; DPName = 'DP1-HQ'; Policy = 'DP1_BdosProfile'; Vector = 'UDP Flood'; StartTime = $StartTimeUTC.AddMinutes(5); EndTime = $StartTimeUTC.AddMinutes(10); MaxBPS = 1.5e9; MaxPPS = 200000; SourceIP = "1.2.3.4" }, @{ AttackID = 1002; DP = '10.10.10.5'; DPName = 'DP2-DR'; Policy = 'DP2_NetworkFlood'; Vector = 'SYN Flood'; StartTime = $StartTimeUTC.AddHours(1); EndTime = $StartTimeUTC.AddHours(1.2); MaxBPS = 8e8; MaxPPS = 550000; SourceIP = "100.64.0.1" } )
+        # Simulate filtering based on requested DPs/Policies (API should ideally do this)
+        $filteredSimulatedData = $simulatedData | Where-Object {
+            ($TargetDPIdentifiers -contains $_.DP) -and `
+            ($null -eq $TargetPoliciesByDP[$_.DP] -or $TargetPoliciesByDP[$_.DP] -contains $_.Policy)
+        }
+
+        # Cache data
+        $cacheFilePath = Join-Path -Path $TempFolder -ChildPath "vision_attack_data.json"
+        try {
+            if (-not (Test-Path -Path $TempFolder)) { New-Item -Path $TempFolder -ItemType Directory -Force | Out-Null }
+            $jsonDataToCache = $filteredSimulatedData | Select-Object *, @{N='StartTime';E={$_.StartTime.ToString("o")}}, @{N='EndTime';E={$_.EndTime.ToString("o")}}
+            $jsonDataToCache | ConvertTo-Json -Depth 5 | Out-File -FilePath $cacheFilePath -Encoding UTF8 -Force
+            Write-Log "Simulated attack data cached to '$cacheFilePath'"
+        } catch { Write-Log "Error caching simulated attack data: $($_.Exception.Message)" -LogError }
+        return $filteredSimulatedData
+    }
+}
+
+
+# --- REWRITTEN: Get-BDoSLifecycleDataFromDP Function using sftp.exe ---
+function Get-BDoSLifecycleDataFromDP {
+    param(
+        # ... (parameters as before) ...
+        [Parameter(Mandatory=$true)][array]$TargetDPIdentifiers,
+        [Parameter(Mandatory=$true)][datetime]$StartTimeUTC,
+        [Parameter(Mandatory=$true)][datetime]$EndTimeUTC
+    )
+    # ... (Check-SftpClient call) ...
+    # ... (Initialize $downloadedLogFiles, $sftpFailures) ...
+
+    # --- CORRECTED: Determine DP Credentials and Settings ---
+    $dpUsername = $DefenseProUsername # From parameter first
+    if ([string]::IsNullOrWhiteSpace($dpUsername)) { $dpUsername = $ScriptConfig.DefensePro.DefaultUsername }
+
+    $dpKeyPath = $DefenseProKeyPath # From parameter first
+    if ([string]::IsNullOrWhiteSpace($dpKeyPath)) { $dpKeyPath = $ScriptConfig.DefensePro.DefaultKeyPath }
+
+    # --- Check DP Password from Parameters first, then Config ---
+    $dpPasswordSecure = $null
+    if ($null -ne $DefenseProPassword -and $DefenseProPassword.Length -gt 0) {
+        # Password provided via parameter takes precedence
+        $dpPasswordSecure = $DefenseProPassword
+        Write-Log "Using DP Password from parameter."
+    } else {
+        # No parameter password, check config
+        $dpPwdValueFromConfig = $ScriptConfig.DefensePro.DefaultPassword
+        $plainDpPwd = ""
+        if ($dpPwdValueFromConfig -match '^[A-Z0-9_]+$' -and -not [string]::IsNullOrWhiteSpace($dpPwdValueFromConfig)) {
+            Write-Log "Attempting to read DP Password from environment variable specified in config: $($dpPwdValueFromConfig)"
+            $envItem = Get-Item "env:$dpPwdValueFromConfig" -ErrorAction SilentlyContinue
+            if ($envItem) {
+                $plainDpPwd = $envItem.Value
+            } else { Write-Log "WARNING: Environment variable '$dpPwdValueFromConfig' for DP Password not found." -LogWarning }
+        } else {
+            $plainDpPwd = $dpPwdValueFromConfig
+             if ($plainDpPwd) { Write-Log "WARNING: Using potentially plain text DP Password from config.psd1." -LogWarning }
+        }
+        if ($plainDpPwd) {
+            $dpPasswordSecure = ConvertTo-SecureString $plainDpPwd -AsPlainText -Force
+            Write-Log "Using DP Password derived from config/env var."
+        }
+    }
+    $dpPasswordProvided = ($null -ne $dpPasswordSecure -and $dpPasswordSecure.Length -gt 0)
+
+    # --- Check DP Key Passphrase ---
+    # (Note: sftp.exe doesn't directly support passphrases in batch mode. Relies on ssh-agent or unencrypted keys)
+    $dpKeyPassphraseValue = $ScriptConfig.DefensePro.DefaultKeyPassphrase
+    if ($dpKeyPassphraseValue -match '^[A-Z0-9_]+$' -and -not [string]::IsNullOrWhiteSpace($dpKeyPassphraseValue)) {
+        # Just log that it might be needed by an agent
+        Write-Log "Note: Config specifies env var '$dpKeyPassphraseValue' for key passphrase. Ensure ssh-agent has the key loaded if passphrase is required."
+    } elseif ($dpKeyPassphraseValue) {
+         Write-Log "Note: Config specifies a key passphrase. Ensure ssh-agent has the key loaded if passphrase is required."
+    }
+
+
+    $remoteLogPath = $ScriptConfig.DefensePro.DefaultLogPath
+    $sftpPort = $ScriptConfig.DefensePro.DefaultPort
+    $sftpOptions = $ScriptConfig.DefensePro.SftpOptions
+
+
+    # Validate necessary config
+    if ([string]::IsNullOrWhiteSpace($dpUsername)) { Write-Log "Error: DP Username is not configured or provided. Cannot attempt SFTP." -LogError; return @() }
+    if ([string]::IsNullOrWhiteSpace($remoteLogPath)) { Write-Log "Error: Default DP Log Path (DefensePro.DefaultLogPath) is not set in config.psd1." -LogError; return @() }
+
+    # Check if key path is valid, prioritize key auth
+    $useKeyAuth = $false
+    if (-not [string]::IsNullOrWhiteSpace($dpKeyPath)) {
+        if (Test-Path $dpKeyPath -PathType Leaf) {
+            $useKeyAuth = $true
+            Write-Log "Using SSH Key for authentication: $dpKeyPath"
+        } else {
+            Write-Log "Warning: Specified SSH Key Path not found: $dpKeyPath. Will attempt connection without explicit key (may use default agent/keys or fail)." -LogWarning
+            $dpKeyPath = $null # Unset invalid path
+        }
+    }
+
+    if (-not $useKeyAuth -and $dpPasswordProvided) {
+        Write-Log "Warning: SSH Key not specified or found. Password provided, but non-interactive password authentication with sftp.exe batch mode is UNRELIABLE and NOT RECOMMENDED. Connection may fail or hang waiting for input." -LogWarning
+        Write-Log "Please configure SSH Key-based authentication for reliable automation." -LogWarning
+    } elseif (-not $useKeyAuth -and -not $dpPasswordProvided) {
+         Write-Log "Warning: Neither SSH Key nor Password provided/found for SFTP. Connection will likely fail." -LogWarning
+    }
+
+    # --- Loop through each target DP ---
+    foreach ($dpIP in $TargetDPIdentifiers) {
+        if ($dpIP -eq "ALL_CACHED") { continue } # Skip special offline identifier
+
+        Write-Log "-----------------------------------------"
+        Write-Log "Processing DP: $dpIP"
+        $dpTempLogFolder = Join-Path -Path $TempFolder -ChildPath $dpIP # Store logs in Temp/DP_IP/
+        if (-not (Test-Path -Path $dpTempLogFolder)) { New-Item -Path $dpTempLogFolder -ItemType Directory -Force | Out-Null }
+
+        $sftpBatchFile = Join-Path $dpTempLogFolder "sftp_batch_$($dpIP)_$(Get-Random).tmp"
+        $sftpListOutputFile = Join-Path $dpTempLogFolder "sftp_ls_$($dpIP)_$(Get-Random).txt"
+        $sftpLogFile = Join-Path $dpTempLogFolder "sftp_run_$($dpIP)_$(Get-Random).log"
+
+        try {
+            # --- 1. List files using sftp batch mode ---
+            $lsCommand = "ls -l $remoteLogPath" # Get detailed listing for timestamps
+            Set-Content -Path $sftpBatchFile -Value $lsCommand -Encoding ASCII -Force
+            Write-Log "Created SFTP batch file for listing: $sftpBatchFile"
+
+            # Build sftp arguments
+            $sftpArgs = @("-b", $sftpBatchFile) # Batch file
+            if ($sftpPort) { $sftpArgs += @("-P", $sftpPort) } # Port
+            if ($useKeyAuth -and $dpKeyPath) { $sftpArgs += @("-i", $dpKeyPath) } # Identity file (key)
+            if ($sftpOptions) { $sftpArgs += $sftpOptions.Split(' ') } # Other options
+            $sftpArgs += "$($dpUsername)@$($dpIP)" # User@Host
+
+            Write-Log "Executing: sftp.exe $($sftpArgs -join ' ')"
+
+            # Start sftp process to list files, redirect output
+            $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+            $processInfo.FileName = "sftp.exe"
+            $processInfo.Arguments = ($sftpArgs -join ' ')
+            $processInfo.RedirectStandardOutput = $true
+            $processInfo.RedirectStandardError = $true
+            $processInfo.UseShellExecute = $false
+            $processInfo.CreateNoWindow = $true
+            $process = New-Object System.Diagnostics.Process
+            $process.StartInfo = $processInfo
+            $process.Start() | Out-Null
+            $stdOut = $process.StandardOutput.ReadToEnd()
+            $stdErr = $process.StandardError.ReadToEnd()
+            $process.WaitForExit() # Wait for the process to complete
+            $exitCode = $process.ExitCode
+
+            # Log stderr/stdout for debugging
+             "SFTP run log stored in: $sftpLogFile" | Out-File -FilePath $sftpLogFile -Encoding UTF8 -Append
+             "Exit Code: $exitCode" | Out-File -FilePath $sftpLogFile -Encoding UTF8 -Append
+             "--- Standard Output ---" | Out-File -FilePath $sftpLogFile -Encoding UTF8 -Append
+             $stdOut | Out-File -FilePath $sftpLogFile -Encoding UTF8 -Append
+             "--- Standard Error ---" | Out-File -FilePath $sftpLogFile -Encoding UTF8 -Append
+             $stdErr | Out-File -FilePath $sftpLogFile -Encoding UTF8 -Append
+
+            if ($exitCode -ne 0) {
+                throw "SFTP connection or listing failed for $dpIP. Exit Code: $exitCode. Check log: $sftpLogFile"
+            }
+            if ($stdErr -match "Permission denied" -or $stdErr -match "Authentication failed") {
+                 throw "SFTP Authentication failed for $dpIP. Check credentials/key permissions. Check log: $sftpLogFile"
+            }
+
+            # Write stdout (which contains the ls output) to a file for parsing
+            $stdOut | Out-File -FilePath $sftpListOutputFile -Encoding UTF8 -Force
+
+            # --- 2. Parse ls output and identify files to download ---
+            $logFilesToDownload = @()
+            # Handle potential empty file if connection worked but dir was empty/inaccessible
+            if (Test-Path $sftpListOutputFile) {
+                $lsOutputLines = Get-Content $sftpListOutputFile -Encoding UTF8 -ErrorAction SilentlyContinue
+            } else {
+                $lsOutputLines = @()
+            }
+
+            $currentYear = Get-Date -Format yyyy
+            foreach ($line in $lsOutputLines) {
+                 # Basic check for log file pattern first
+                 if ($line -match '(BDOS.*?\.log)\s*$' ) { # Match filename at end of line
+                    $fileName = $matches[1].Trim()
+                    # Attempt to extract date components - highly dependent on `ls` output format
+                    if ($line -match '\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d+)\s+(\d{2}:\d{2}|\d{4})\s+' ) {
+                        $month = $matches[1]
+                        $day = $matches[2]
+                        $timeOrYear = $matches[3]
+                        $fileTimestamp = $null
+                        try {
+                            $year = $currentYear
+                            $time = "00:00"
+                            if ($timeOrYear -match ':') { $time = $timeOrYear } else { $year = $timeOrYear }
+                            # Attempt to parse - CultureInfo might be needed if month names aren't English
+                            $dateTimeString = "$day $month $year $time"
+                            $fileTimestamp = ([datetime]::ParseExact($dateTimeString, "dd MMM yyyy HH:mm", [System.Globalization.CultureInfo]::InvariantCulture)).ToUniversalTime()
+                        } catch {
+                             Write-Log "Warning: Could not parse timestamp for file '$fileName' from line: $line. Skipping time check." -LogWarning
+                        }
+
+                        # Filter by time if timestamp was parsed, otherwise include based on name match alone (less precise)
+                        if (($null -eq $fileTimestamp) -or ($fileTimestamp -ge $StartTimeUTC.AddHours(-2) -and $fileTimestamp -le $EndTimeUTC.AddHours(2))) { # Wider buffer due to parse uncertainty
+                            $logFilesToDownload += $fileName
+                        }
+                    } else {
+                         # Fallback if detailed ls parsing fails - include if name matches
+                         Write-Log "Warning: Could not parse timestamp details for '$fileName' from line: $line. Including based on name." -LogWarning
+                         $logFilesToDownload += $fileName
+                    }
+                 }
+            }
+
+            if ($logFilesToDownload.Count -eq 0) {
+                Write-Log "No relevant BDOS*.log files identified from listing on $dpIP for the time range." -LogWarning
+                continue # Move to next DP
+            }
+
+             #FIXED: Corrected variable expansion in Write-Log
+             Write-Log "Identified $($logFilesToDownload.Count) potential log file(s) on $($dpIP): $($logFilesToDownload -join ', ')"
+
+            # --- 3. Download identified files using a new batch ---
+            $downloadCommands = $logFilesToDownload | ForEach-Object {
+                $remoteFilePath = "$($remoteLogPath)/$_".Replace('\','/') # Ensure forward slashes
+                $localFilePath = Join-Path -Path $dpTempLogFolder -ChildPath $_
+                # Quote paths if they might contain spaces (less likely on DP, safer for local)
+                "get `"$remoteFilePath`" `"$localFilePath`""
+            }
+            Set-Content -Path $sftpBatchFile -Value $downloadCommands -Encoding ASCII -Force
+            Write-Log "Created SFTP batch file for downloading."
+
+            Write-Log "Executing: sftp.exe $($sftpArgs -join ' ')" # Re-use args from list command
+
+            # Start sftp process to download files
+            $process.StartInfo.Arguments = ($sftpArgs -join ' ') # Ensure arguments are set again
+            $process.Start() | Out-Null
+            $stdOut = $process.StandardOutput.ReadToEnd() # Capture output which might show progress/errors
+            $stdErr = $process.StandardError.ReadToEnd()
+            $process.WaitForExit()
+            $exitCode = $process.ExitCode
+
+             # Log results
+             "--- Download Attempt ---" | Out-File -FilePath $sftpLogFile -Encoding UTF8 -Append
+             "Exit Code: $exitCode" | Out-File -FilePath $sftpLogFile -Encoding UTF8 -Append
+             "--- Standard Output ---" | Out-File -FilePath $sftpLogFile -Encoding UTF8 -Append
+             $stdOut | Out-File -FilePath $sftpLogFile -Encoding UTF8 -Append
+             "--- Standard Error ---" | Out-File -FilePath $sftpLogFile -Encoding UTF8 -Append
+             $stdErr | Out-File -FilePath $sftpLogFile -Encoding UTF8 -Append
+
+            if ($exitCode -ne 0) {
+                 # Check stderr for specific file errors if possible, otherwise log general failure
+                 Write-Log "Error during SFTP download phase for $dpIP. Exit Code: $exitCode. Some files might not have been downloaded. Check log: $sftpLogFile" -LogError
+                 $sftpFailures.Add("$dpIP (Download Error - ExitCode $exitCode)")
+            }
+
+            # Verify which files were actually downloaded
+            foreach ($fileName in $logFilesToDownload) {
+                 $localPath = Join-Path -Path $dpTempLogFolder -ChildPath $fileName
+                 if (Test-Path $localPath) {
+                     # Check if file size is non-zero (basic check)
+                     if ((Get-Item $localPath).Length -gt 0) {
+                         Write-Log "Successfully verified download: $localPath"
+                         $downloadedLogFiles.Add($localPath)
+                     } else {
+                          Write-Log "Warning: Downloaded file '$fileName' for $dpIP is empty. Removing." -LogWarning
+                          Remove-Item $localPath -Force -ErrorAction SilentlyContinue
+                          $sftpFailures.Add("$dpIP/$fileName (Empty File)")
+                     }
+                 } else {
+                    # Log specific file failure if possible based on stdout/stderr analysis
+                    Write-Log "Error: File '$fileName' was expected but not found locally after download attempt for $dpIP." -LogError
+                    $sftpFailures.Add("$dpIP/$fileName (Download Failed/Not Found)")
+                 }
+            }
+
+        } catch {
+            Write-Log "Error during SFTP operations for DP $dpIP. Error: $($_.Exception.Message)" -LogError
+            $sftpFailures.Add("$dpIP (Overall Error: $($_.Exception.Message.Split([Environment]::NewLine)[0]))")
+             if (-not $Global:UnavailableDevices.Contains("$dpIP (SFTP Error)")) { $Global:UnavailableDevices.Add("$dpIP (SFTP Error)") }
+        } finally {
+            # Clean up temporary files
+            Remove-Item $sftpBatchFile -Force -ErrorAction SilentlyContinue
+            Remove-Item $sftpListOutputFile -Force -ErrorAction SilentlyContinue
+            Write-Log "Finished processing DP: $dpIP"
+            Write-Log "-----------------------------------------"
+        }
+    } # End foreach DP
+
+    Write-Log "SFTP Log Retrieval Summary: Attempted $($TargetDPIdentifiers.Count) DPs. Verified $($downloadedLogFiles.Count) downloaded files. Failed operations: $($sftpFailures.Count)."
+    if ($sftpFailures.Count -gt 0) { Write-Log "Failed SFTP operations details logged or listed for: $($sftpFailures -join ', ')" -LogError }
+
+    return $downloadedLogFiles
+}
+
+
+# --- MODIFIED: Parse-AttackData Function (Placeholder for parsing logic remains) ---
+function Parse-AttackData {
+    param(
+        [Parameter(Mandatory=$true)]
+        [array]$RawAttackData, # Data from Vision API
+
+        [Parameter(Mandatory=$false)]
+        [array]$DownloadedLogFilePaths # Array of local file paths from sftp.exe
+    )
+    Write-Log "Parsing and analyzing collected attack data..."
+    # --- Filter API Data ---
+    $filteredAttacks = @() # Initialize as empty array
+    if ($null -ne $RawAttackData -and $RawAttackData.Count -gt 0) {
+        $excludeFiltersConfig = $ScriptConfig.General.ExcludeFilters -split ',' | ForEach-Object {$_.Trim()} | Where-Object {$_}
+        $hardcodedExclusions = @('Packet Anomalies')
+        $allExclusions = $excludeFiltersConfig + $hardcodedExclusions
+        Write-Log "Applying API data exclusion filters: $(($allExclusions | Where-Object {$_}) -join ', ')"
+        $filteredAttacks = $RawAttackData | Where-Object { $_.Vector -notin $allExclusions }
+        $excludedCount = $RawAttackData.Count - $filteredAttacks.Count
+        Write-Log "Excluded $excludedCount attacks based on API data filters."
+    } else {
+         Write-Log "No raw attack data from API provided for parsing."
+    }
+
+
+    # --- Process Downloaded BDOS Logs (Parsing Logic is Placeholder) ---
+    $parsedLogEvents = @()
+    if ($null -ne $DownloadedLogFilePaths -and $DownloadedLogFilePaths.Count -gt 0) {
+        Write-Log "Processing $($DownloadedLogFilePaths.Count) downloaded BDOS log file(s) (Placeholder Parsing)..."
+        foreach ($logPath in $DownloadedLogFilePaths) {
+            Write-Log "Reading log file: $logPath"
+            if (-not (Test-Path $logPath)) { Write-Log "Warning: Log file path not found: $logPath" -LogWarning; continue }
+            try {
+                # ***************************************************************
+                # *** PLACEHOLDER: BDOS Log Parsing Logic Goes Here ***
+                # Implement using Get-Content, regex (-match), -split, etc.
+                # Extract Timestamp, EventType, Policy, Vector, AttackID, Rates...
+                Write-Log "*** Placeholder Log Parsing for '$logPath'. Needs Implementation. ***" -LogWarning
+                # $parsedLogEvents += @{ Event="Example"; LogFile=$logPath; Detail="Parsed info..." } # Add actual parsed data
+                # ***************************************************************
+            } catch { Write-Log "Error processing log file '$logPath': $($_.Exception.Message)" -LogError }
+        }
+        Write-Log "Finished processing log files. Extracted $($parsedLogEvents.Count) placeholder events."
+    } else {
+        Write-Log "No downloaded BDOS log files provided or found to process."
+    }
+
+    # --- Correlate API Data with Log Data (Placeholder) ---
+    Write-Log "Correlating API data with parsed log events (Placeholder)..."
+    # In a real implementation, you would merge/enrich $filteredAttacks
+    # with information from $parsedLogEvents based on Attack ID, Policy, Timestamps etc.
+    # $correlatedData = ... logic to combine $filteredAttacks and $parsedLogEvents ...
+
+    # --- Prepare $reportData (using $filteredAttacks for now) ---
+    $totalAttacks = 0
+    $reportData = @{ LifecycleLogEvents = $parsedLogEvents } # Initialize with log events
+
+    if ($filteredAttacks.Count -gt 0) {
+        $totalAttacks = $filteredAttacks.Count
+        $topN = [int]$ScriptConfig.General.Top_N
+        $sortedAttacks = $filteredAttacks | Sort-Object -Property @{Expression={ [double]$_.MaxBPS }} -Descending
+        $topAttacksByBPS = $sortedAttacks | Select-Object -First $topN
+        $largestAttackBpsObj = $sortedAttacks | Select-Object -First 1
+        $largestAttackBps = if ($largestAttackBpsObj) { [double]$largestAttackBpsObj.MaxBPS } else { 0 }
+        $largestAttackPpsObj = $filteredAttacks | Sort-Object -Property @{Expression={[double]$_.MaxPPS}} -Descending | Select-Object -First 1
+        $largestAttackPps = if ($largestAttackPpsObj) { [double]$largestAttackPpsObj.MaxPPS } else { 0 }
+        $attackVectorsSummary = $filteredAttacks | Group-Object Vector | Select-Object @{N='VectorName'; E={$_.Name}}, Count | Sort-Object Count -Descending
+
+        $reportData = @{
+            ExecutionDetails = $null # Populated later
+            AttackSummary = @{
+                TotalAttacks = $totalAttacks
+                LargestAttackGbps = if ($largestAttackBps -gt 0) { [math]::Round($largestAttackBps / 1e9, 3) } else { 0 }
+                LargestAttackKpps = if ($largestAttackPps -gt 0) { [math]::Round($largestAttackPps / 1e3, 0) } else { 0 }
+                AttackVectors = $attackVectorsSummary
+                AttackWaves = "Not Implemented" # Placeholder
+            }
+            # Select and format data for tables
+            TopAttackTable = $topAttacksByBPS | Select-Object AttackID, DPName, Policy, Vector, @{N='Max Gbps';E={[math]::Round([double]$_.MaxBPS / 1e9, 3)}}, @{N='Max Kpps';E={[math]::Round([double]$_.MaxPPS / 1e3, 0).ToString("N0")}}, @{N='Start Time (UTC)';E={$_.StartTime.ToString("yyyy-MM-dd HH:mm:ss")}}, @{N='End Time (UTC)';E={$_.EndTime.ToString("yyyy-MM-dd HH:mm:ss")}}
+            AllAttackTable = $filteredAttacks | Select-Object AttackID, DPName, Policy, Vector, @{N='Max Gbps';E={[math]::Round([double]$_.MaxBPS / 1e9, 3)}}, @{N='Max Kpps';E={[math]::Round([double]$_.MaxPPS / 1e3, 0).ToString("N0")}}, @{N='Start Time (UTC)';E={$_.StartTime.ToString("yyyy-MM-dd HH:mm:ss")}}, @{N='End Time (UTC)';E={$_.EndTime.ToString("yyyy-MM-dd HH:mm:ss")}} | Sort-Object 'Start Time (UTC)'
+            BpsPpsChartData = $filteredAttacks | Select-Object StartTime, MaxBPS, MaxPPS, Vector # Simplified placeholder
+            PieChartData = $attackVectorsSummary # Use vector summary
+            SourceIpTable = $filteredAttacks | Where-Object {$_.SourceIP} | Group-Object SourceIP | Select-Object @{N='SourceIP';E={$_.Name}}, Count | Sort-Object Count -Descending
+            SampleDataTable = $topAttacksByBPS # Placeholder
+            LifecycleLogEvents = $parsedLogEvents # Include the parsed events
+        }
+    } else {
+        # If no API data, create a minimal structure
+         $reportData = @{
+            ExecutionDetails = $null
+            AttackSummary = @{ TotalAttacks = 0 }
+            TopAttackTable = @()
+            AllAttackTable = @()
+            BpsPpsChartData = @()
+            PieChartData = @()
+            SourceIpTable = @()
+            SampleDataTable = @()
+            LifecycleLogEvents = $parsedLogEvents
+         }
+    }
+
+    Write-Log "Data parsing complete. Processed $totalAttacks attacks (after API filtering)."
+    return $reportData
+}
+
+
+# --- MODIFIED: Generate-HtmlReport Function ---
+function Generate-HtmlReport {
+    param(
+        [Parameter(Mandatory=$true)]
+        [hashtable]$ReportData,
+        [Parameter(Mandatory=$true)]
+        [hashtable]$ExecutionDetails
+    )
+    $outputHtmlPath = Join-Path -Path $TempFolder -ChildPath "DP-Attack-Story_Report.html"
+    Write-Log "Generating HTML report at '$outputHtmlPath'"
+    if (-not (Test-Path -Path $TempFolder)) { try { New-Item -Path $TempFolder -ItemType Directory -Force -ErrorAction Stop | Out-Null } catch { Write-Log "FATAL: Cannot create Temp folder '$TempFolder'. Error: $($_.Exception.Message)" -IsFatal } }
+
+    # Helper to convert simple tables to HTML fragment
+    function ConvertTo-HtmlTableFragment { param($Data) if ($Data -and $Data.Count -gt 0) { return $Data | ConvertTo-Html -Fragment -As Table } else { return "<p>No data available.</p>" } }
+
+    # FIXED: Ensure no characters after @" on the starting line of the here-string
+    $htmlContent = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DP Attack Story Report - $($ExecutionDetails.Environment)</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; margin: 20px; background-color: #f8f9fa; color: #333; }
+        .container { max-width: 1200px; margin: auto; background-color: #fff; padding: 25px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); border-radius: 8px; }
+        table { border-collapse: collapse; width: 100%; margin: 25px 0; border: 1px solid #dee2e6; }
+        th, td { border: 1px solid #dee2e6; padding: 12px 15px; text-align: left; vertical-align: top; }
+        th { background-color: #e9ecef; font-weight: 600; color: #495057; }
+        tr:nth-child(even) { background-color: #f8f9fa; }
+        h1, h2, h3 { color: #0056b3; border-bottom: 2px solid #e9ecef; padding-bottom: 8px; margin-top: 1.5em; margin-bottom: 1em; }
+        h1 { text-align: center; border-bottom-color: #0056b3; }
+        h2 { font-size: 1.6em; }
+        h3 { font-size: 1.3em; border-bottom: none; color: #007bff; margin-top: 1.8em; }
+        .header, .summary { background-color: #f8f9fa; border: 1px solid #dee2e6; padding: 20px; margin-bottom: 25px; border-radius: 5px; }
+        .header b, .summary b { display: inline-block; min-width: 180px; font-weight: 600; color: #495057;} /* Align keys */
+        .placeholder { color: #6c757d; font-style: italic; background-color: #f8f9fa; padding: 10px; border-radius: 4px; border: 1px dashed #ced4da; }
+        .excluded-report { color: #dc3545; font-weight: bold; }
+        .excluded-explanation { border-left: 4px solid #dc3545; padding-left: 15px; background-color: #f8d7da; color: #721c24; margin: 15px 0; padding: 15px; border-radius: 4px; }
+        .code { font-family: SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace; background-color: #e9ecef; padding: 2px 5px; border-radius: 3px; font-size: 0.9em; }
+        .footer { text-align: center; margin-top: 30px; padding-top: 15px; border-top: 1px solid #eee; font-size: 0.9em; color: #6c757d; }
+        .table-responsive { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+        pre { background-color: #e9ecef; padding: 10px; border: 1px solid #ced4da; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word; }
+        @media (max-width: 768px) { th, td { padding: 8px 10px; } .header b, .summary b { min-width: 120px; } }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>DP Attack Story Report</h1>
+    <!-- Execution Details -->
+    <div class='header'>
+        <h2>Execution Details</h2>
+        <b>Environment:</b> $($ExecutionDetails.Environment)<br>
+        <b>Run Timestamp:</b> $($ExecutionDetails.RunTime.ToString("yyyy-MM-dd HH:mm:ss")) (Local Time)<br>
+        <b>Report Time Range (UTC):</b> $($ExecutionDetails.TimeRangeStart.ToString("yyyy-MM-dd HH:mm:ss")) to $($ExecutionDetails.TimeRangeEnd.ToString("yyyy-MM-dd HH:mm:ss"))<br>
+        <b>Selected DPs:</b> $(if ($ExecutionDetails.SelectedDPs -contains "ALL_CACHED") {"All (from Cache)"} else {$ExecutionDetails.SelectedDPs -join ', '})<br>
+        <b>Selected Policies:</b> $($ExecutionDetails.SelectedPoliciesText)<br>
+        <b>Top N Attacks Shown:</b> $($ExecutionDetails.TopNValue)<br>
+        $(-join (if ($ExecutionDetails.UnavailableDevices) {"<b class='excluded-report'>Unavailable/Excluded Devices:</b> $($ExecutionDetails.UnavailableDevices -join ', ')<br>"} else {''}))
+        <b>Script Path:</b> <span class='code'>$($ExecutionDetails.ScriptPath)</span><br>
+        <b>Executed By:</b> $($ExecutionDetails.ExecutedBy)
+    </div>
+    <!-- Attack Summary -->
+    <div class='summary'>
+        <h2>Attack Summary</h2>
+        <b>Total Attacks Found (After API Filtering):</b> $($ReportData.AttackSummary.TotalAttacks)<br>
+        <b>Largest Attack (Bandwidth):</b> $($ReportData.AttackSummary.LargestAttackGbps) Gbps<br>
+        <b>Largest Attack (Packets):</b> $($ReportData.AttackSummary.LargestAttackKpps.ToString("N0")) Kpps<br>
+        <b>Identified Attack Waves:</b> <span class='placeholder'>$($ReportData.AttackSummary.AttackWaves)</span><br> <!-- Placeholder value -->
+        <b>Attack Vectors Breakdown (from API Data):</b><br>
+        <div class='table-responsive'>$($ReportData.AttackSummary.AttackVectors | Select-Object @{N='Vector';E={$_.VectorName}}, Count | ConvertTo-HtmlTableFragment)</div>
+    </div>
+    <!-- Top N Attack Table -->
+    <h2>Top $($ExecutionDetails.TopNValue) Attacks (by Max BPS, from API Data)</h2>
+    <div class='table-responsive'>$(ConvertTo-HtmlTableFragment $ReportData.TopAttackTable)</div>
+    <!-- All Detected Attacks Table -->
+    <h2>All Detected Attacks (After API Filtering)</h2>
+    <div class='table-responsive'>$(ConvertTo-HtmlTableFragment $ReportData.AllAttackTable)</div>
+    <!-- Source IPs Table -->
+    <h2>Unique Source IPs (Detected in Filtered API Data)</h2>
+    <div class='table-responsive'>$(ConvertTo-HtmlTableFragment $ReportData.SourceIpTable)</div>
+    <!-- Graphs Placeholder -->
+    <h2>Graphs <span class='placeholder'>(Placeholder)</span></h2>
+    <div class='placeholder'>Combined BPS/PPS timeline graphs and per-attack detail graphs would be generated here using JavaScript charting libraries. Needs implementation.</div>
+    <!-- Sample Data Placeholder -->
+    <h2>Sample Data <span class='placeholder'>(Placeholder)</span></h2>
+    <div class='placeholder'>A section displaying sample packet data or detailed event logs for key attacks would appear here. Requires implementation.</div>
+"@ # End of main HTML block before dynamic SFTP section
+
+    # --- Modify BDOS Lifecycle Details Section ---
+    $htmlContent += @"
+    <h2>BDOS Lifecycle Details (from SFTP Logs)</h2>
+"@
+    if ($ReportData.ContainsKey('LifecycleLogEvents') -and $ReportData.LifecycleLogEvents -ne $null -and $ReportData.LifecycleLogEvents.Count -gt 0) {
+         $htmlContent += @"
+    <div class='placeholder'>
+        <p>BDOS log files were downloaded via SFTP using <span class='code'>sftp.exe</span>. The following represent raw events extracted (parsing logic is currently a placeholder).</p>
+        <p><b class='excluded-report'>Requires Implementation:</b> Detailed parsing and correlation logic within the script (<span class='code'>Parse-AttackData</span> function) is needed to interpret these logs fully and integrate them with the API data above.</p>
+        <pre><code>$($ReportData.LifecycleLogEvents | Out-String)</code></pre>
+    </div>
+"@
+    } elseif ($Global:SftpClientAvailable -eq $false) {
+         $htmlContent += @"
+    <div class='excluded-explanation'>
+        BDOS Log download via SFTP was skipped because the built-in OpenSSH client (<span class='code'>sftp.exe</span>) was not found in the system PATH. Ensure the Windows OpenSSH Client feature is installed.
+    </div>
+"@
+    } else {
+        $htmlContent += @"
+    <div class='placeholder'>
+        <p>SFTP log download using <span class='code'>sftp.exe</span> was attempted, but no relevant BDOS log files were found/identified for the specified time range/path, or downloads failed (check script execution logs in the Output folder).</p>
+        <p>Verify:</p>
+        <ul>
+            <li>DP SFTP credentials (SSH Key recommended) and user permissions.</li>
+            <li>DP Log Path configuration (<span class='code'>config.psd1: DefensePro.DefaultLogPath</span>).</li>
+            <li>Network connectivity (firewalls) between the script host and DP management interfaces on the SFTP port (default 22).</li>
+            <li>Correctness of file timestamp parsing logic within the script (may need adjustment based on DP's <span class='code'>ls</span> output).</li>
+            <li>SFTP run logs in the <span class='code'>Temp/[DP_IP]/</span> folders for detailed errors.</li>
+        </ul>
+        <p><b class='excluded-report'>Note:</b> Even if logs were downloaded, detailed parsing logic in the script (<span class='code'>Parse-AttackData</span>) needs implementation to interpret them.</p>
+    </div>
+"@
+    }
+
+    # --- Final HTML closing tags ---
+     $htmlContent += @"
+    <!-- Footer -->
+    <div class='footer'>Report generated by DP-Attack-Story (PowerShell Version) on $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</div>
+</div> <!-- /container -->
+<script> console.log("DP Attack Story Report Generated: $($ExecutionDetails.RunTime.ToString('o'))"); </script>
+</body>
+</html>
+"@
+    try {
+        $htmlContent | Out-File -FilePath $outputHtmlPath -Encoding UTF8 -Force
+        Write-Log "HTML report generated successfully: '$outputHtmlPath'"
+        return $outputHtmlPath
+    } catch { Write-Log "FATAL: Error generating HTML report '$outputHtmlPath': $($_.Exception.Message)" -IsFatal; return $null }
+}
+
+
+# --- Helper Function: Compress-OutputFolder (Keep as before) ---
+function Compress-OutputFolder { param([string]$SourceFolderPath, [string]$DestinationArchivePath)
+    Write-Log "Attempting to compress '$SourceFolderPath' to '$DestinationArchivePath'"
+    if (-not (Test-Path -Path $SourceFolderPath -PathType Container)) { Write-Log "Source folder '$SourceFolderPath' not found." -LogError; return $false }
+    if (-not (Get-ChildItem -Path $SourceFolderPath)) { Write-Log "Source folder '$SourceFolderPath' is empty. Skipping." -LogWarning; return $true }
+    $destDir = Split-Path -Path $DestinationArchivePath -Parent
+    if (-not (Test-Path -Path $destDir)) { try { New-Item -Path $destDir -ItemType Directory -Force -ErrorAction Stop | Out-Null } catch { Write-Log "Error creating dest dir '$destDir': $($_.Exception.Message)" -LogError; return $false } }
+    if (Test-Path $DestinationArchivePath) { Write-Log "Removing existing archive: '$DestinationArchivePath'"; Remove-Item -Path $DestinationArchivePath -Force -ErrorAction SilentlyContinue }
+    try { Compress-Archive -Path "$SourceFolderPath\*" -DestinationPath $DestinationArchivePath -Force -ErrorAction Stop; Write-Log "Successfully compressed to '$DestinationArchivePath'"; return $true }
+    catch { Write-Log "Error during compression: $($_.Exception.Message)" -LogError; if (Test-Path $DestinationArchivePath) { Remove-Item $DestinationArchivePath -Force -ErrorAction SilentlyContinue }; return $false }
+}
+
+
+# ============================================================================
+# --- Main Script Logic ---
+# ============================================================================
+
+# 1. Initialize Environment & Load Config
+Write-Log "==================== Starting DP-Attack-Story PowerShell Script ===================="
+Write-Log "Script execution started at $scriptStartTimestamp"
+Check-SftpClient | Out-Null # Check if sftp.exe is available, result stored in $Global:SftpClientAvailable
+Load-Configuration -Path $ConfigPath
+if (-not (Test-Path -Path $OutputFolder)) { try { New-Item -Path $OutputFolder -ItemType Directory -Force -ErrorAction Stop | Out-Null } catch { Write-Host "FATAL: Cannot create Output folder '$OutputFolder'. Exiting."; Exit 1 } }
+if (-not $Offline) {
+    Write-Log "ONLINE mode. Clearing Temp folder: '$TempFolder'"
+    if (Test-Path -Path $TempFolder) { Get-ChildItem -Path $TempFolder -Recurse | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue }
+    else { New-Item -Path $TempFolder -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null }
+    if (-not (Test-Path -Path $TempFolder)) { Write-Log "FATAL: Failed to ensure Temp folder '$TempFolder' exists." -IsFatal }
+} else {
+    Write-Log "OFFLINE mode. Using cached data from '$TempFolder'."
+    if (-not (Test-Path -Path $TempFolder -PathType Container) -or -not (Get-ChildItem -Path $TempFolder)) { Write-Log "FATAL: Offline mode selected, but Temp folder '$TempFolder' is empty or does not exist." -IsFatal }
+}
+
+# 2. Determine Vision Credentials
+$visionCreds = @{}
+if ($Offline) { Write-Log "Skipping Vision connection in Offline mode." }
+elseif ($UseCached) {
+    Write-Log "Using cached Vision credentials from config.psd1"
+    if (-not $ScriptConfig.Vision -or -not $ScriptConfig.Vision.IP -or -not $ScriptConfig.Vision.Username) { Write-Log "FATAL: Cached credentials missing required fields (Vision.IP, Vision.Username) in config.psd1" -IsFatal }
+    $visionCreds.IP = $ScriptConfig.Vision.IP
+    $visionCreds.Username = $ScriptConfig.Vision.Username
+
+    # --- CORRECTED: Handle Vision Password ---
+    $pwdValueFromConfig = $ScriptConfig.Vision.Password
+    $plainPwd = ""
+    # Check if the value from config *looks like* an environment variable NAME
+    # (Adjust this check if your variable names differ significantly, e.g., contain hyphens)
+    if ($pwdValueFromConfig -match '^[A-Z0-9_]+$' -and -not [string]::IsNullOrWhiteSpace($pwdValueFromConfig)) {
+        Write-Log "Attempting to read Vision Password from environment variable specified in config: $($pwdValueFromConfig)"
+        $envItem = Get-Item "env:$pwdValueFromConfig" -ErrorAction SilentlyContinue
+        if ($envItem) {
+            $plainPwd = $envItem.Value
+        } else {
+            Write-Log "WARNING: Environment variable '$pwdValueFromConfig' for Vision Password not found." -LogWarning
+        }
+    } else {
+        # Assume it's a plain text password (or empty)
+        $plainPwd = $pwdValueFromConfig
+        if ($plainPwd) { Write-Log "WARNING: Using potentially plain text Vision Password from config.psd1." -LogWarning }
+    }
+    $visionCreds.Password = ConvertTo-SecureString $plainPwd -AsPlainText -Force
+
+    # --- CORRECTED: Handle Vision Root Password ---
+    $rootPwdValueFromConfig = $ScriptConfig.Vision.RootPassword
+    $plainRootPwd = ""
+    if ($rootPwdValueFromConfig -match '^[A-Z0-9_]+$' -and -not [string]::IsNullOrWhiteSpace($rootPwdValueFromConfig)) {
+        Write-Log "Attempting to read Vision Root Password from environment variable specified in config: $($rootPwdValueFromConfig)"
+        $envItem = Get-Item "env:$rootPwdValueFromConfig" -ErrorAction SilentlyContinue
+        if ($envItem) {
+            $plainRootPwd = $envItem.Value
+        } else {
+            Write-Log "WARNING: Environment variable '$rootPwdValueFromConfig' for Vision Root Password not found." -LogWarning
+        }
+    } else {
+        $plainRootPwd = $rootPwdValueFromConfig
+         if ($plainRootPwd) { Write-Log "WARNING: Using potentially plain text Vision Root Password from config.psd1." -LogWarning }
+    }
+    $visionCreds.RootPassword = ConvertTo-SecureString $plainRootPwd -AsPlainText -Force
+
+    if ($visionCreds.Password.Length -eq 0) { Write-Log "WARNING: Vision Password appears empty after checking config/env vars." -LogWarning }
+}
+elseif ($PSCmdlet.ParameterSetName -eq 'ExplicitArgs') {
+    Write-Log "Using explicit Vision credentials from command line."
+    $visionCreds.IP = $VisionIP; $visionCreds.Username = $VisionUsername
+    if(-not $PSBoundParameters.ContainsKey('VisionPassword') -or ($null -eq $VisionPassword) -or ($VisionPassword.Length -eq 0)) { $visionCreds.Password = Read-Host -Prompt "Enter Vision Password for '$($visionCreds.Username)'" -AsSecureString } else { $visionCreds.Password = $VisionPassword }
+    if(-not $PSBoundParameters.ContainsKey('VisionRootPassword') -or ($null -eq $VisionRootPassword) -or ($VisionRootPassword.Length -eq 0)) { $visionCreds.RootPassword = $null } else { $visionCreds.RootPassword = $VisionRootPassword }
+} else { # Interactive mode
+     Write-Log "Running interactively, prompting for Vision credentials..."
+     $visionCreds.IP = Read-Host -Prompt "Enter Vision/CC IP Address"
+     while ([string]::IsNullOrWhiteSpace($visionCreds.IP)) { $visionCreds.IP = Read-Host -Prompt "Vision IP cannot be empty."}
+     $visionCreds.Username = Read-Host -Prompt "Enter Vision/CC Username"
+     while ([string]::IsNullOrWhiteSpace($visionCreds.Username)) { $visionCreds.Username = Read-Host -Prompt "Vision Username cannot be empty."}
+     $visionCreds.Password = Read-Host -Prompt "Enter Vision/CC Password for '$($visionCreds.Username)'" -AsSecureString
+     $visionCreds.RootPassword = Read-Host -Prompt "Enter Vision/CC Root Password (optional, press Enter)" -AsSecureString
+}
+
+# 3. Determine Time Range
+# [Code Block for Time Range Determination - Reuse previous version's logic here]
+# This block sets $Global:SelectedTimeRange and caches if not offline
+$timeRangeType = ""; if ($PSBoundParameters.ContainsKey('Hours')) { $timeRangeType = 'Hours' } elseif ($PSBoundParameters.ContainsKey('DateRange')) { $timeRangeType = 'DateRange' } elseif ($PSBoundParameters.ContainsKey('EpochRange')) { $timeRangeType = 'EpochRange' } elseif ($PSBoundParameters.ContainsKey('PreviousTimeRange')) { $timeRangeType = 'PreviousTimeRange' }
+$utcNow = (Get-Date).ToUniversalTime(); $timeRangeDetermined = $false
+if ($timeRangeType) { switch ($timeRangeType) { 'Hours' { if ($Hours -le 0) { Write-Log "FATAL: Hours must be positive." -IsFatal } $Global:SelectedTimeRange = @{ Start = $utcNow.AddHours(-$Hours); End = $utcNow }; Write-Log "Selected time range: Last $Hours hours."; $timeRangeDetermined = $true } 'DateRange' { if ($DateRange.Count -ne 2) { Write-Log "FATAL: DateRange requires two arguments." -IsFatal } try { $start = ([datetime]$DateRange[0]).ToUniversalTime(); $end = ([datetime]$DateRange[1]).ToUniversalTime(); if ($start -ge $end) { throw "Start date must be before end date." } $Global:SelectedTimeRange = @{ Start = $start; End = $end }; Write-Log "Selected time range: $($start.ToString('u')) to $($end.ToString('u'))"; $timeRangeDetermined = $true } catch { Write-Log "FATAL: Error parsing DateRange: $($_.Exception.Message)." -IsFatal } } 'EpochRange' { if ($EpochRange.Count -ne 2) { Write-Log "FATAL: EpochRange requires two arguments." -IsFatal } try { $start = [DateTimeOffset]::FromUnixTimeSeconds($EpochRange[0]).UtcDateTime; $end = [DateTimeOffset]::FromUnixTimeSeconds($EpochRange[1]).UtcDateTime; if ($start -ge $end) { throw "Start epoch must be before end epoch." } $Global:SelectedTimeRange = @{ Start = $start; End = $end }; Write-Log "Selected time range (Epoch): $($start.ToString('u')) to $($end.ToString('u'))"; $timeRangeDetermined = $true } catch { Write-Log "FATAL: Error parsing EpochRange: $($_.Exception.Message)." -IsFatal } } 'PreviousTimeRange' { $cachedTimeFile = Join-Path $TempFolder "last_time_range.json"; if (Test-Path $cachedTimeFile) { try { $timeData = Get-Content $cachedTimeFile -Raw | ConvertFrom-Json -EA Stop; $start = [datetime]::Parse($timeData.Start, $null, [System.Globalization.DateTimeStyles]::RoundtripKind); $end = [datetime]::Parse($timeData.End, $null, [System.Globalization.DateTimeStyles]::RoundtripKind); if ($start -ge $end) { throw "Invalid cached range."} $Global:SelectedTimeRange = @{ Start = $start; End = $end }; Write-Log "Using previous time range: $($start.ToString('u')) to $($end.ToString('u'))"; $timeRangeDetermined = $true } catch { Write-Log "FATAL: Error reading/parsing cached time file '$cachedTimeFile': $($_.Exception.Message)" -IsFatal } } else { Write-Log "FATAL: PreviousTimeRange selected, but file not found: '$cachedTimeFile'" -IsFatal } } } }
+if (-not $timeRangeDetermined -and $PSCmdlet.ParameterSetName -eq 'Interactive') { # Interactive time prompt
+    $choice = Read-Host "Select Time: 1.Hours 2.DateRange 3.Epoch 4.Previous"; switch ($choice) { '1' { $h = Read-Host "Hours"; if ($h -match '^\d+$' -and [int]$h -gt 0) { $Global:SelectedTimeRange = @{ Start = $utcNow.AddHours(-[int]$h); End = $utcNow } } else { Write-Log "FATAL: Invalid hours." -IsFatal } } '2' { $s = Read-Host "Start (YYYY-MM-DD HH:MM:SS)"; $e = Read-Host "End"; try { $start=([datetime]$s).ToUniversalTime(); $end=([datetime]$e).ToUniversalTime(); if($start -ge $end){throw}; $Global:SelectedTimeRange=@{Start=$start;End=$end} } catch { Write-Log "FATAL: Invalid dates." -IsFatal } } '3' { $s=Read-Host "Start Epoch"; $e=Read-Host "End Epoch"; try {$start=[DateTimeOffset]::FromUnixTimeSeconds([long]$s).UtcDateTime; $end=[DateTimeOffset]::FromUnixTimeSeconds([long]$e).UtcDateTime; if($start -ge $end){throw}; $Global:SelectedTimeRange=@{Start=$start;End=$end} } catch { Write-Log "FATAL: Invalid epoch." -IsFatal} } '4' { $cachedTimeFile = Join-Path $TempFolder "last_time_range.json"; if (Test-Path $cachedTimeFile) { try { $timeData = Get-Content $cachedTimeFile -Raw | ConvertFrom-Json -EA Stop; $start = [datetime]::Parse($timeData.Start, $null, [System.Globalization.DateTimeStyles]::RoundtripKind); $end = [datetime]::Parse($timeData.End, $null, [System.Globalization.DateTimeStyles]::RoundtripKind); $Global:SelectedTimeRange = @{ Start = $start; End = $end } } catch { Write-Log "FATAL: Error reading cached time file." -IsFatal } } else { Write-Log "FATAL: PreviousTimeRange selected, file not found." -IsFatal } } default { Write-Log "FATAL: Invalid choice." -IsFatal } } }
+if (-not $Global:SelectedTimeRange) { Write-Log "FATAL: Could not determine time range." -IsFatal }
+if (-not $Offline -and $Global:SelectedTimeRange) { $cachedTimeFile = Join-Path $TempFolder "last_time_range.json"; try { @{ Start = $Global:SelectedTimeRange.Start.ToString("o"); End = $Global:SelectedTimeRange.End.ToString("o") } | ConvertTo-Json -Depth 1 | Out-File $cachedTimeFile -Encoding UTF8 -Force; Write-Log "Time range cached." } catch { Write-Log "Warning: Could not cache time range." -LogWarning} }
+
+
+# 4. Connect to Vision (if not offline)
+if (-not $Offline) {
+    Write-Log "Connecting to Vision API..."
+    if (-not (Connect-VisionAPI -IP $visionCreds.IP -Username $visionCreds.Username -Password $visionCreds.Password)) {
+        Write-Log "FATAL: Failed to connect to Vision API." -IsFatal
+    }
+}
+
+# 5. Determine Target DPs and Policies
+# [Code Block for DP/Policy Selection - Reuse previous version's logic here]
+# This block populates $Global:SelectedDPs and $Global:SelectedPolicies
+$allManagedDPs = @(); $availableDPs = @()
+if (-not $Offline) { Write-Log "Fetching managed DPs from Vision..."; $allManagedDPs = Get-ManagedDefenseProsFromVision; if ($null -eq $allManagedDPs) { $allManagedDPs = @() } $availableDPs = $allManagedDPs | Where-Object { $_.Status -ne 'Failed' -and $_.Status -ne 'Not Synchronized' -and $_.Status -ne 'Connecting' }; $Global:UnavailableDevices = [System.Collections.Generic.List[string]]::new(($allManagedDPs | Where-Object { $_.Status -eq 'Failed' -or $_.Status -eq 'Not Synchronized' -or $_.Status -eq 'Connecting' } | Select-Object -ExpandProperty Name)); if ($Global:UnavailableDevices.Count -gt 0) { Write-Log "Note: Following DPs excluded due to status: $($Global:UnavailableDevices -join ', ')" -LogWarning } if ($availableDPs.Count -eq 0) { Write-Log "WARNING: No Active DPs found via Vision." -LogWarning } else { Write-Log "Available DPs: $(($availableDPs | Select-Object -ExpandProperty Name) -join ', ')" } } else { Write-Log "Offline mode: DP/Policy filters apply to cache." }
+$Global:SelectedDPs = @(); $Global:SelectedPolicies = @{}; $dpIdentifiersToProcess = @(); $selectAllDPs = $false
+if ($PSBoundParameters.ContainsKey('DefenseProList')) { if ([string]::IsNullOrWhiteSpace($DefenseProList)) { $selectAllDPs = $true } else { $dpIdentifiersToProcess = $DefenseProList.Split(',') | ForEach-Object { $_.Trim() } | Where-Object {$_} } } elseif ($PSCmdlet.ParameterSetName -eq 'Interactive') { if ($availableDPs.Count -gt 0) { $dpInput = Read-Host "Enter DPs (comma-sep, blank for ALL)"; if ([string]::IsNullOrWhiteSpace($dpInput)) { $selectAllDPs = $true } else { $dpIdentifiersToProcess = $dpInput.Split(',') | ForEach-Object { $_.Trim() } | Where-Object {$_} } } else { Write-Log "No available DPs from Vision to select interactively." -LogWarning; $selectAllDPs = $true } } else { $selectAllDPs = $true }
+if ($selectAllDPs) { if (-not $Offline) { $Global:SelectedDPs = $availableDPs | Select-Object -ExpandProperty IPAddress } else { $Global:SelectedDPs = @("ALL_CACHED") } } else { if (-not $Offline) { foreach ($requestedDP in $dpIdentifiersToProcess) { $foundDP = $availableDPs | Where-Object { $_.Name -eq $requestedDP -or $_.IPAddress -eq $requestedDP } | Select-Object -First 1; if ($foundDP) { $Global:SelectedDPs += $foundDP.IPAddress } else { Write-Log "Warning: Requested DP '$requestedDP' not found/active." -LogWarning; $Global:UnavailableDevices.Add($requestedDP) } } } else { $Global:SelectedDPs = $dpIdentifiersToProcess } }
+Write-Log "Final DP Identifiers selected: $($Global:SelectedDPs -join ', ')"
+$policyInputProvided = $PSBoundParameters.ContainsKey('PolicyList'); $selectAllPolicies = $false
+if ($policyInputProvided) { if ($null -eq $PolicyList -or $PolicyList.Count -eq 0 -or ($PolicyList.Count -eq 1 -and [string]::IsNullOrWhiteSpace($PolicyList[0]))) { $selectAllPolicies = $true } } elseif ($PSCmdlet.ParameterSetName -eq 'Interactive' -and $Global:SelectedDPs.Count -gt 0 -and $Global:SelectedDPs[0] -ne "ALL_CACHED") { $policyInput = Read-Host "Enter Policies per DP (comma-sep lists per DP, or blank for ALL)"; if ([string]::IsNullOrWhiteSpace($policyInput)) { $selectAllPolicies = $true } else { $PolicyList = $policyInput.Split(',') | ForEach-Object { $_.Trim() } | Where-Object {$_}; if ($PolicyList.Count -eq 0) { $selectAllPolicies = $true }; $policyInputProvided = $true } } else { $selectAllPolicies = $true }
+if ($Global:SelectedDPs.Count -gt 0) { if ($selectAllPolicies) { foreach ($dpId in $Global:SelectedDPs) { $Global:SelectedPolicies[$dpId] = $null } } else { if ($PolicyList.Count -ne $Global:SelectedDPs.Count -and $Global:SelectedDPs[0] -ne "ALL_CACHED") { Write-Log "WARNING: Policy list count mismatches DP count. Using ALL policies." -LogWarning; foreach ($dpId in $Global:SelectedDPs) { $Global:SelectedPolicies[$dpId] = $null } } else { for ($i = 0; $i -lt $Global:SelectedDPs.Count; $i++) { $dpId = $Global:SelectedDPs[$i]; $policyString = $PolicyList[$i]; if ([string]::IsNullOrWhiteSpace($policyString)) { $Global:SelectedPolicies[$dpId] = $null } else { $policiesForDP = $policyString.Split(',') | ForEach-Object { $_.Trim() } | Where-Object {$_}; $Global:SelectedPolicies[$dpId] = $policiesForDP } } } } }
+
+
+# 6. Data Acquisition (Vision API + SFTP Logs)
+Write-Log "Starting data acquisition phase..."
+$rawAttackData = @()
+$downloadedLogFilePaths = @()
+
+if (($Global:SelectedDPs.Count -gt 0 -and $Global:SelectedDPs[0] -ne "ALL_CACHED") -or $Offline) {
+    $rawAttackData = Get-AttackDataFromVision -StartTimeUTC $Global:SelectedTimeRange.Start -EndTimeUTC $Global:SelectedTimeRange.End -TargetDPIdentifiers $Global:SelectedDPs -TargetPoliciesByDP $Global:SelectedPolicies
+    if (-not $Offline -and $Global:SelectedDPs.Count -gt 0 -and $Global:SelectedDPs[0] -ne "ALL_CACHED") {
+         $dpIPsForSftp = $Global:SelectedDPs | Where-Object { $_ -ne "ALL_CACHED" }
+         if ($dpIPsForSftp.Count -gt 0) {
+            $downloadedLogFilePaths = Get-BDoSLifecycleDataFromDP -TargetDPIdentifiers $dpIPsForSftp -StartTimeUTC $Global:SelectedTimeRange.Start -EndTimeUTC $Global:SelectedTimeRange.End
+         }
+    } elseif (-not $Offline) { Write-Log "Skipping SFTP: 'All DPs' selected without concrete IPs." -LogWarning }
+    if (($null -eq $rawAttackData -or $rawAttackData.Count -eq 0)) { Write-Log "Warning: No attack data from Vision API/Cache." -LogWarning } else { Write-Log "Retrieved/loaded $($rawAttackData.Count) records from Vision API/Cache." }
+    if ($downloadedLogFilePaths.Count -gt 0) { Write-Log "Downloaded $($downloadedLogFilePaths.Count) BDOS log(s) via SFTP." } elseif (-not $Offline) { Write-Log "No BDOS logs downloaded via SFTP." -LogWarning }
+} else { Write-Log "Skipping data acquisition: No target DPs selected/available." -LogWarning }
+
+
+# 7. Data Processing & Analysis
+Write-Log "Starting data processing and analysis..."
+$parsedReportData = Parse-AttackData -RawAttackData $rawAttackData -DownloadedLogFilePaths $downloadedLogFilePaths
+$executionDetails = @{ ScriptName = $MyInvocation.MyCommand.Name; ScriptPath = $MyInvocation.MyCommand.Definition; RunTime = $scriptStartTimestamp; TimeRangeStart = $Global:SelectedTimeRange.Start; TimeRangeEnd = $Global:SelectedTimeRange.End; Environment = $Environment; SelectedDPs = $Global:SelectedDPs; SelectedPoliciesText = ($Global:SelectedPolicies.GetEnumerator() | ForEach-Object { "$($_.Name): $(if ($_.Value) {$_.Value -join ', '} else {'ALL'})" }) -join '; '; TopNValue = $ScriptConfig.General.Top_N; UnavailableDevices = $Global:UnavailableDevices; ExecutedBy = "$($env:USERDOMAIN)\$($env:USERNAME)" }
+if ($null -eq $parsedReportData) { Write-Log "Warning: Data parsing returned null." -LogWarning; $parsedReportData = @{ AttackSummary = @{ TotalAttacks = 0 }; TopAttackTable = @(); AllAttackTable = @() } }
+
+
+# 8. Report Generation
+Write-Log "Starting HTML report generation..."
+$htmlReportPath = Generate-HtmlReport -ReportData $parsedReportData -ExecutionDetails $executionDetails
+
+
+# 9. Output Management & Compression
+if ($htmlReportPath -and (Test-Path $htmlReportPath)) {
+    $finalReportName = "DP-Attack-Story_Report_$($Environment)_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
+    $finalReportPath = Join-Path -Path $OutputFolder -ChildPath $finalReportName
+    try { Copy-Item -Path $htmlReportPath -Destination $finalReportPath -Force -ErrorAction Stop; Write-Log "Final HTML report saved to: '$finalReportPath'" }
+    catch { Write-Log "Error copying report to Output: $($_.Exception.Message)" -LogError }
+    if ($ScriptConfig.General.Compress_Output -eq $true) {
+        $zipFileName = "$($Environment)_AttackStoryData_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
+        $reportsEnvFolder = Join-Path -Path $ReportsFolder -ChildPath $Environment
+        $zipFilePath = Join-Path -Path $reportsEnvFolder -ChildPath $zipFileName
+        Write-Log "Compression enabled. Archiving '$TempFolder'..."
+        if (Compress-OutputFolder -SourceFolderPath $TempFolder -DestinationArchivePath $zipFilePath) { Write-Log "Archive created: '$zipFilePath'" }
+        else { Write-Log "Compression failed." -LogError }
+    } else { Write-Log "Compression disabled." }
+} else { Write-Log "HTML report generation failed. Skipping final copy/compression." -LogError }
+
+# 10. Email Notification (Excluded)
+
+# --- Script End ---
+$scriptEndTime = Get-Date
+$scriptDuration = New-TimeSpan -Start $scriptStartTimestamp -End $scriptEndTime
+Write-Log "Script finished at $scriptEndTime"
+Write-Log "Total execution time: $($scriptDuration.ToString('g'))"
+Write-Log "==================== DP-Attack-Story PowerShell Script Finished ===================="
+Exit 0
+===============================================================================================================================================
+
+config.psd1
+===============================================================================================================================================
+# Configuration for DP-Attack-Story PowerShell Script
+# File: config.psd1
+# Loaded via Import-PowerShellDataFile
+# NOTE: DO NOT use $env:VARNAME directly in this file.
+# Put the NAME of the environment variable (e.g., "VISION_PASSWORD")
+# or leave blank/placeholder if not using env vars for that value.
+
+@{
+    # General Settings
+    General = @{
+        Top_N = 10
+        AttackWaveMinutes = 5
+        Compress_Output = $true
+        ExcludeFilters = "Memcached-Server-Reflect"
+    }
+
+    # Vision/CyberController Cached Credentials (if using -UseCached)
+    Vision = @{
+        IP            = "192.168.1.100" # Example IP - CHANGE THIS
+        Username      = "admin"         # Example Username - CHANGE THIS
+        # --- Password Handling ---
+        # Option 1: Store the NAME of the env var (Recommended if using env vars)
+        Password      = "VISION_PASSWORD" # Script will look for $env:VISION_PASSWORD
+        # Option 2: Leave blank/placeholder if providing via parameter/prompt
+        # Password      = ""
+        # Option 3: Plain text (NOT RECOMMENDED)
+        # Password      = "plain_text_password_here"
+
+        # --- Root Password Handling (Similar options) ---
+        RootPassword  = "VISION_ROOT_PASSWORD" # Script will look for $env:VISION_ROOT_PASSWORD
+    }
+
+    # --- DefensePro SSH/SFTP Settings ---
+    DefensePro = @{
+        DefaultUsername = "dp-sftp-user" # CHANGE THIS
+
+        # --- SSH Key (STRONGLY RECOMMENDED) ---
+        DefaultKeyPath = "C:\Users\YourUser\.ssh\id_rsa_dp" # CHANGE THIS Path
+
+        # --- Password (Not recommended for sftp.exe automation) ---
+        # Option 1: Store env var NAME
+        DefaultPassword = "DP_PASSWORD" # Script will look for $env:DP_PASSWORD
+        # Option 2: Leave blank
+        # DefaultPassword = ""
+
+        # --- Key Passphrase ---
+        # Option 1: Store env var NAME
+        DefaultKeyPassphrase = "DP_KEY_PASSPHRASE" # Script will look for $env:DP_KEY_PASSPHRASE
+        # Option 2: Leave blank if key has no passphrase
+        # DefaultKeyPassphrase = ""
+
+        # --- Other Settings ---
+        DefaultLogPath = "/var/log" # CHANGE THIS
+        # DefaultPort = 22
+        # SftpOptions = "-o StrictHostKeyChecking=no"
+    }
+}
+===============================================================================================================================================
