@@ -50,26 +50,32 @@ class VisionClient {
         }
     }
 
-    [object]GetAttackData([string]$deviceIP, [datetime]$startTime, [datetime]$endTime) {
+    [object]GetAttackData([string]$deviceIP, [datetime]$startTime, [datetime]$endTime, [string[]]$policies) {
         $url = "https://$($this.IP)/mgmt/monitor/reporter/reports-ext/DP_ATTACK_REPORTS"
         
-        $startEpoch = [int][double]::Parse((Get-Date -Date $startTime -UFormat %s))
-        $endEpoch = [int][double]::Parse((Get-Date -Date $endTime -UFormat %s))
-        
+        # Create policy filters
+        $policyFilters = $policies | ForEach-Object {
+            @{
+                type = "termFilter"
+                field = "policyName"
+                value = $_
+            }
+        }
+
         $body = @{
             criteria = @(
                 @{
                     type = "timeFilter"
                     field = "endTime"
-                    lower = $startEpoch
-                    upper = $endEpoch
+                    lower = [int][double]::Parse((Get-Date -Date $startTime -UFormat %s))
+                    upper = [int][double]::Parse((Get-Date -Date $endTime -UFormat %s))
                 },
                 @{
                     type = "termFilter"
                     field = "deviceIp"
                     value = $deviceIP
                 }
-            )
+            ) + $policyFilters
             pagination = @{
                 size = 1000
                 page = 0
@@ -131,20 +137,16 @@ class PSCPClient {
             $plinkPath = "C:\Program Files\PuTTY\plink.exe"
             $remoteCmd = "ls -1 $($this.RemotePath)/BDOS$startYear*"
             
-            # Accept host key automatically and get file list
             $files = & $plinkPath -ssh -P $this.Port -l $this.Username -pw $this.Password -batch -no-antispoof $this.DeviceIP $remoteCmd 2>$null
 
-            # Process each matching file
             foreach ($file in $files) {
                 $fileName = Split-Path $file.Trim() -Leaf
                 if ($fileName -match $pattern) {
-                    $this.RemotePath= "$($this.RemotePath)/$fileName"
-
+                    $this.RemotePath = "$($this.RemotePath)/$fileName"
                     $localPath = Join-Path $this.TempFolder $fileName
 
                     Write-Host "Downloading $fileName..."
                     
-                    # Use PSCP to download the file
                     & $this.PSCPPath -P $this.Port -pw $this.Password -batch -no-antispoof `
                         "$($this.Username)@$($this.DeviceIP):$this.RemotePath" `
                         $localPath 2>$null
@@ -225,6 +227,28 @@ function New-HTMLReport {
         }
         $html += "</table></div>"
     }
+
+    # Add BDOS log analysis section
+    $html += "<div class='section'>"
+    $html += "<h2>BDOS Log Analysis</h2>"
+    $html += "<table><tr><th>Time</th><th>Attack Type</th><th>Source IP</th><th>Destination IP</th><th>Action</th><th>Packets</th></tr>"
+    
+    foreach ($file in $LogFiles) {
+        $content = Get-Content (Join-Path "./Temp" $file)
+        foreach ($line in $content) {
+            if ($line -match '\[(.*?)\].*?attack_type=(.*?),.*?src_ip=(.*?),.*?dst_ip=(.*?),.*?action=(.*?),.*?packets=(\d+)') {
+                $html += "<tr>"
+                $html += "<td>$($matches[1])</td>"
+                $html += "<td>$($matches[2])</td>"
+                $html += "<td>$($matches[3])</td>"
+                $html += "<td>$($matches[4])</td>"
+                $html += "<td>$($matches[5])</td>"
+                $html += "<td>$($matches[6])</td>"
+                $html += "</tr>"
+            }
+        }
+    }
+    $html += "</table></div>"
 
     $html += "</body></html>"
 
@@ -340,8 +364,8 @@ try {
             $logFiles = $pscpClient.GetAttackLogs($startYear, $fromMonth, $toMonth)
             Write-Host "Retrieved log files: $($logFiles -join ', ')"
 
-            # Get attack data from Vision
-            $attackData = $vision.GetAttackData($device.Key, $startTime, $endTime)
+            # Get attack data from Vision with policies
+            $attackData = $vision.GetAttackData($device.Key, $startTime, $endTime, $device.Value)
 
             # Generate comprehensive report
             $reportPath = "Reports\Attack_Report_$($device.Key)_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
